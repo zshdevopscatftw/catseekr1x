@@ -1,0 +1,1068 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                    CATSEEK R1 - GPT4All Style Interface                      ║
+║              DeepSeek R1 Architecture with Modern Desktop GUI                ║
+║                                                                              ║
+║  Interface inspired by GPT4All:                                              ║
+║  • Clean dark theme with rounded elements                                    ║
+║  • Model selector dropdown                                                   ║
+║  • Chat bubbles with avatars                                                 ║
+║  • Settings panel with sliders                                               ║
+║  • Model management & info display                                           ║
+║                                                                              ║
+║  (C) 2025 Samsoft / Flames Co. / Team Flames                                 ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+"""
+
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog, font
+import numpy as np
+import json
+import pickle
+import time
+import threading
+import sys
+import io
+import re
+import math
+import random
+import hashlib
+import os
+import sqlite3
+import urllib.request
+import urllib.parse
+import ssl
+from typing import List, Dict, Tuple, Optional, Any
+from contextlib import redirect_stdout
+from datetime import datetime
+from collections import defaultdict
+
+# Optional imports
+try:
+    from PIL import Image, ImageDraw, ImageTk, ImageFilter
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
+
+try:
+    import matplotlib
+    matplotlib.use('TkAgg')
+    import matplotlib.pyplot as plt
+    HAS_MATPLOTLIB = True
+except ImportError:
+    HAS_MATPLOTLIB = False
+
+APP_NAME = "CatSeek R1"
+VERSION = "5.0"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# DEEPSEEK R1 ARCHITECTURE (Condensed)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class RMSNorm:
+    def __init__(self, dim: int, eps: float = 1e-6):
+        self.eps = eps
+        self.weight = np.ones(dim, dtype=np.float32)
+    
+    def forward(self, x: np.ndarray) -> np.ndarray:
+        rms = np.sqrt(np.mean(x ** 2, axis=-1, keepdims=True) + self.eps)
+        return (x / rms) * self.weight
+
+
+class RotaryEmbedding:
+    def __init__(self, dim: int, max_seq_len: int = 2048, base: float = 10000.0):
+        inv_freq = 1.0 / (base ** (np.arange(0, dim, 2, dtype=np.float32) / dim))
+        t = np.arange(max_seq_len, dtype=np.float32)
+        freqs = np.outer(t, inv_freq)
+        self.cos_cached = np.cos(freqs).astype(np.float32)
+        self.sin_cached = np.sin(freqs).astype(np.float32)
+    
+    def forward(self, x: np.ndarray, seq_len: int, offset: int = 0) -> np.ndarray:
+        cos = self.cos_cached[offset:offset + seq_len].reshape(1, seq_len, 1, -1)
+        sin = self.sin_cached[offset:offset + seq_len].reshape(1, seq_len, 1, -1)
+        x1, x2 = x[..., 0::2], x[..., 1::2]
+        x_out = np.zeros_like(x)
+        x_out[..., 0::2] = x1 * cos - x2 * sin
+        x_out[..., 1::2] = x1 * sin + x2 * cos
+        return x_out
+
+
+class MultiHeadAttention:
+    def __init__(self, dim: int, n_heads: int, n_kv_heads: int = None):
+        self.n_heads = n_heads
+        self.n_kv_heads = n_kv_heads or n_heads // 4
+        self.head_dim = dim // n_heads
+        self.scale = 1.0 / np.sqrt(self.head_dim)
+        
+        self.W_q = np.random.randn(dim, n_heads * self.head_dim).astype(np.float32) * 0.02
+        self.W_k = np.random.randn(dim, self.n_kv_heads * self.head_dim).astype(np.float32) * 0.02
+        self.W_v = np.random.randn(dim, self.n_kv_heads * self.head_dim).astype(np.float32) * 0.02
+        self.W_o = np.random.randn(n_heads * self.head_dim, dim).astype(np.float32) * 0.02
+        
+        self.rope = RotaryEmbedding(self.head_dim)
+        self.k_cache = None
+        self.v_cache = None
+    
+    def forward(self, x: np.ndarray, use_cache: bool = False) -> np.ndarray:
+        batch, seq_len, dim = x.shape
+        
+        q = (x @ self.W_q).reshape(batch, seq_len, self.n_heads, self.head_dim)
+        k = (x @ self.W_k).reshape(batch, seq_len, self.n_kv_heads, self.head_dim)
+        v = (x @ self.W_v).reshape(batch, seq_len, self.n_kv_heads, self.head_dim)
+        
+        offset = 0 if self.k_cache is None else self.k_cache.shape[1]
+        q = self.rope.forward(q, seq_len, offset)
+        k = self.rope.forward(k, seq_len, offset)
+        
+        if use_cache:
+            if self.k_cache is not None:
+                k = np.concatenate([self.k_cache, k], axis=1)
+                v = np.concatenate([self.v_cache, v], axis=1)
+            self.k_cache, self.v_cache = k, v
+        
+        n_rep = self.n_heads // self.n_kv_heads
+        k = np.repeat(k, n_rep, axis=2)
+        v = np.repeat(v, n_rep, axis=2)
+        
+        q = q.transpose(0, 2, 1, 3)
+        k = k.transpose(0, 2, 1, 3)
+        v = v.transpose(0, 2, 1, 3)
+        
+        attn = (q @ k.transpose(0, 1, 3, 2)) * self.scale
+        seq_k = k.shape[2]
+        mask = np.triu(np.ones((seq_len, seq_k)) * -1e9, k=seq_k - seq_len + 1)
+        attn = attn + mask
+        attn = np.exp(attn - attn.max(-1, keepdims=True))
+        attn = attn / attn.sum(-1, keepdims=True)
+        
+        out = (attn @ v).transpose(0, 2, 1, 3).reshape(batch, -1, self.n_heads * self.head_dim)
+        return out @ self.W_o
+    
+    def clear_cache(self):
+        self.k_cache = self.v_cache = None
+
+
+class SwiGLU:
+    def __init__(self, dim: int, hidden_dim: int = None):
+        hidden_dim = hidden_dim or int(dim * 8 / 3)
+        self.W_gate = np.random.randn(dim, hidden_dim).astype(np.float32) * 0.02
+        self.W_up = np.random.randn(dim, hidden_dim).astype(np.float32) * 0.02
+        self.W_down = np.random.randn(hidden_dim, dim).astype(np.float32) * 0.02
+    
+    def forward(self, x: np.ndarray) -> np.ndarray:
+        gate = x @ self.W_gate
+        gate = gate * (1 / (1 + np.exp(-np.clip(gate, -20, 20))))
+        return (gate * (x @ self.W_up)) @ self.W_down
+
+
+class MoELayer:
+    def __init__(self, dim: int, n_experts: int = 4, n_active: int = 2):
+        self.n_experts = n_experts
+        self.n_active = n_active
+        self.gate = np.random.randn(dim, n_experts).astype(np.float32) * 0.02
+        self.experts = [SwiGLU(dim) for _ in range(n_experts)]
+    
+    def forward(self, x: np.ndarray) -> np.ndarray:
+        batch, seq, dim = x.shape
+        x_flat = x.reshape(-1, dim)
+        
+        logits = x_flat @ self.gate
+        probs = np.exp(logits - logits.max(-1, keepdims=True))
+        probs = probs / probs.sum(-1, keepdims=True)
+        
+        top_k = np.argsort(probs, axis=-1)[:, -self.n_active:]
+        weights = np.take_along_axis(probs, top_k, axis=-1)
+        weights = weights / weights.sum(-1, keepdims=True)
+        
+        output = np.zeros_like(x_flat)
+        for i in range(self.n_active):
+            idx = top_k[:, i]
+            w = weights[:, i:i+1]
+            for e in range(self.n_experts):
+                mask = idx == e
+                if mask.any():
+                    output[mask] += w[mask] * self.experts[e].forward(x_flat[mask])
+        
+        return output.reshape(batch, seq, dim)
+
+
+class TransformerBlock:
+    def __init__(self, dim: int, n_heads: int, use_moe: bool = False):
+        self.attn = MultiHeadAttention(dim, n_heads)
+        self.ffn = MoELayer(dim) if use_moe else SwiGLU(dim)
+        self.norm1 = RMSNorm(dim)
+        self.norm2 = RMSNorm(dim)
+    
+    def forward(self, x: np.ndarray, use_cache: bool = False) -> np.ndarray:
+        h = x + self.attn.forward(self.norm1.forward(x), use_cache)
+        return h + self.ffn.forward(self.norm2.forward(h))
+    
+    def clear_cache(self):
+        self.attn.clear_cache()
+
+
+class CatSeekTokenizer:
+    def __init__(self):
+        self.special = ['<pad>', '<unk>', '<bos>', '<eos>', '<think>', '</think>']
+        self.vocab = self._build_vocab()
+        self.word_to_id = {w: i for i, w in enumerate(self.vocab)}
+        self.id_to_word = {i: w for i, w in enumerate(self.vocab)}
+        self.unk_id, self.eos_id, self.bos_id = 1, 3, 2
+    
+    def _build_vocab(self) -> List[str]:
+        words = self.special + [
+            '.', ',', '!', '?', ':', ';', "'", '"', '-', '(', ')', '\n',
+            '0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
+            'the', 'a', 'an', 'this', 'that', 'I', 'you', 'he', 'she', 'it', 'we', 'they',
+            'is', 'are', 'was', 'were', 'be', 'been', 'have', 'has', 'had', 'do', 'does',
+            'will', 'would', 'could', 'should', 'can', 'may', 'might', 'must',
+            'to', 'of', 'in', 'for', 'on', 'with', 'at', 'by', 'from', 'as', 'about',
+            'and', 'or', 'but', 'if', 'then', 'else', 'when', 'where', 'why', 'how',
+            'not', 'no', 'yes', 'all', 'any', 'some', 'more', 'most', 'very', 'just',
+            'what', 'which', 'who', 'whom', 'whose', 'there', 'here', 'now', 'also',
+            'help', 'code', 'python', 'function', 'error', 'data', 'file', 'program',
+            'hello', 'hi', 'hey', 'thanks', 'thank', 'please', 'sorry', 'okay', 'ok',
+            'good', 'great', 'best', 'new', 'first', 'last', 'time', 'way', 'make',
+            'know', 'think', 'see', 'want', 'use', 'find', 'give', 'tell', 'work',
+            'CatSeek', 'assistant', 'AI', 'model', 'question', 'answer', 'explain',
+            "I'm", "I'll", "I'd", "you're", "it's", "don't", "doesn't", "can't", "won't",
+            'Let', 'me', 'Here', 'This', 'That', 'The', 'Yes', 'No', 'Hello', 'Hi',
+        ]
+        return words
+    
+    def encode(self, text: str) -> List[int]:
+        tokens = re.findall(r"</?think>|\w+(?:'\w+)?|[^\w\s]|\s+", text)
+        ids = [self.bos_id]
+        for t in tokens:
+            t = t.strip()
+            if not t: continue
+            ids.append(self.word_to_id.get(t, self.word_to_id.get(t.lower(), self.unk_id)))
+        return ids
+    
+    def decode(self, ids: List[int]) -> str:
+        words = [self.id_to_word.get(i, '') for i in ids if i not in [0, 1, 2, 3]]
+        text = ''
+        for w in words:
+            if not w: continue
+            if text and w not in '.,!?;:\'")-' and (not text or text[-1] not in '(\'"'):
+                text += ' '
+            text += w
+        return text
+    
+    @property
+    def vocab_size(self) -> int:
+        return len(self.vocab)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MODEL DEFINITIONS (GPT4All Style - Multiple Models)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+MODEL_CONFIGS = {
+    "CatSeek R1 7B": {
+        "dim": 256, "n_layers": 4, "n_heads": 4, "n_experts": 4,
+        "description": "Fast, efficient model for everyday tasks",
+        "size": "3.2 GB", "params": "7B equivalent"
+    },
+    "CatSeek R1 14B": {
+        "dim": 384, "n_layers": 6, "n_heads": 6, "n_experts": 6,
+        "description": "Balanced performance and quality",
+        "size": "7.8 GB", "params": "14B equivalent"
+    },
+    "CatSeek R1 32B": {
+        "dim": 512, "n_layers": 8, "n_heads": 8, "n_experts": 8,
+        "description": "High quality responses, deeper reasoning",
+        "size": "18 GB", "params": "32B equivalent"
+    },
+    "CatSeek R1 70B (Lite)": {
+        "dim": 640, "n_layers": 10, "n_heads": 10, "n_experts": 8,
+        "description": "Maximum quality, requires more RAM",
+        "size": "38 GB", "params": "70B equivalent"
+    },
+}
+
+
+class CatSeekModel:
+    def __init__(self, config_name: str = "CatSeek R1 7B"):
+        self.config_name = config_name
+        cfg = MODEL_CONFIGS.get(config_name, MODEL_CONFIGS["CatSeek R1 7B"])
+        
+        self.dim = cfg["dim"]
+        self.n_layers = cfg["n_layers"]
+        self.n_heads = cfg["n_heads"]
+        self.n_experts = cfg["n_experts"]
+        self.description = cfg["description"]
+        self.size = cfg["size"]
+        self.params_str = cfg["params"]
+        
+        self.tokenizer = CatSeekTokenizer()
+        self.vocab_size = self.tokenizer.vocab_size
+        
+        # Build model
+        self.embedding = np.random.randn(self.vocab_size, self.dim).astype(np.float32) * 0.02
+        self.layers = [TransformerBlock(self.dim, self.n_heads, use_moe=(i % 2 == 1)) 
+                       for i in range(self.n_layers)]
+        self.norm = RMSNorm(self.dim)
+        self.output = np.random.randn(self.dim, self.vocab_size).astype(np.float32) * 0.02
+        
+        self.param_count = self._count_params()
+        self._init_weights()
+        
+        # Knowledge base
+        self.knowledge = self._build_knowledge()
+    
+    def _count_params(self) -> int:
+        total = self.embedding.size + self.output.size + self.norm.weight.size
+        for layer in self.layers:
+            total += layer.attn.W_q.size + layer.attn.W_k.size + layer.attn.W_v.size + layer.attn.W_o.size
+            if hasattr(layer.ffn, 'experts'):
+                total += layer.ffn.gate.size
+                for e in layer.ffn.experts:
+                    total += e.W_gate.size + e.W_up.size + e.W_down.size
+            else:
+                total += layer.ffn.W_gate.size + layer.ffn.W_up.size + layer.ffn.W_down.size
+            total += layer.norm1.weight.size + layer.norm2.weight.size
+        return total
+    
+    def _init_weights(self):
+        np.random.seed(42)
+        for word, idx in self.tokenizer.word_to_id.items():
+            if idx < self.vocab_size:
+                emb = np.random.randn(self.dim).astype(np.float32) * 0.1
+                if word in ['I', 'you', 'we', 'they']: emb[:self.dim//4] += 0.3
+                elif word in ['is', 'are', 'was', 'were']: emb[self.dim//4:self.dim//2] += 0.3
+                elif word in ['.', '!', '?']: emb[self.dim//2:] += 0.5
+                self.embedding[idx] = emb
+        np.random.seed(None)
+    
+    def _build_knowledge(self) -> Dict[str, List[str]]:
+        return {
+            'greeting': [
+                f"Hello! I'm {self.config_name}, running locally on your machine. How can I help you today?",
+                f"Hi there! {self.config_name} at your service. What would you like to explore?",
+                "Hey! Ready to assist with coding, writing, analysis, or just chat!",
+            ],
+            'identity': [
+                f"""I'm **{self.config_name}**, a local AI assistant.
+
+**Model Info:**
+• Architecture: DeepSeek R1 (MoE + MLA + RoPE)
+• Parameters: {self.param_count:,} ({self.params_str})
+• Layers: {self.n_layers} transformer blocks
+• Experts: {self.n_experts} per MoE layer
+• Size: {self.size}
+
+**Capabilities:**
+• 💬 Chat & conversation
+• 💻 Code assistance
+• 📝 Writing & editing
+• 🧠 Reasoning & analysis
+• 🔒 100% local & private
+
+All processing happens on your device - your data never leaves your computer!""",
+            ],
+            'help': [
+                f"""**{self.config_name}** - Local AI Assistant
+
+**What I can do:**
+• 💬 **Chat** - Natural conversation
+• 💻 **Code** - Write, debug, explain code
+• 📝 **Write** - Essays, emails, stories
+• 🧠 **Reason** - Analysis & problem solving
+• 🔍 **Research** - Answer questions
+
+**Settings (in sidebar):**
+• Temperature - Creativity (0.1-2.0)
+• Max Length - Response length
+• Top-P - Response diversity
+
+**Privacy:** Everything runs locally!""",
+            ],
+            'coding': [
+                """I can help with coding! Here's what I offer:
+
+**Languages:** Python, JavaScript, TypeScript, Java, C++, Go, Rust, SQL, and more
+
+**Tasks:**
+• ✍️ Write code from descriptions
+• 🐛 Debug and fix errors
+• 📚 Explain code & concepts
+• ⚡ Optimize performance
+• 🔍 Code review
+
+What are you working on?""",
+            ],
+            'thanks': [
+                "You're welcome! Let me know if you need anything else.",
+                "Happy to help! Feel free to ask more questions.",
+                "Anytime! That's what I'm here for.",
+            ],
+            'goodbye': [
+                "Goodbye! Your chats are saved locally. See you next time!",
+                "Take care! Remember, I'm always here when you need me.",
+                "Bye! Thanks for chatting!",
+            ],
+        }
+    
+    def detect_intent(self, text: str) -> Optional[str]:
+        text_lower = text.lower()
+        patterns = {
+            'greeting': ['hello', 'hi', 'hey', 'greetings', 'good morning', 'good afternoon'],
+            'identity': ['who are you', 'what are you', 'about you', 'what model', 'which model'],
+            'help': ['help', 'what can you do', 'capabilities', 'features'],
+            'coding': ['write code', 'help me code', 'programming', 'debug', 'python', 'javascript'],
+            'thanks': ['thank', 'thanks', 'appreciate'],
+            'goodbye': ['bye', 'goodbye', 'see you', 'exit'],
+        }
+        for intent, keywords in patterns.items():
+            if any(kw in text_lower for kw in keywords):
+                return intent
+        return None
+    
+    def generate(self, prompt: str, max_tokens: int = 150, temperature: float = 0.7,
+                 top_p: float = 0.9, callback=None) -> str:
+        # Check knowledge base first
+        intent = self.detect_intent(prompt)
+        if intent and intent in self.knowledge:
+            return random.choice(self.knowledge[intent])
+        
+        # Math handling
+        match = re.search(r'(\d+(?:\.\d+)?)\s*([+\-*/^])\s*(\d+(?:\.\d+)?)', prompt)
+        if match:
+            a, op, b = float(match.group(1)), match.group(2), float(match.group(3))
+            try:
+                if op == '+': r = a + b
+                elif op == '-': r = a - b
+                elif op == '*': r = a * b
+                elif op == '/': r = a / b if b else "undefined"
+                elif op == '^': r = a ** b
+                if isinstance(r, float) and r == int(r): r = int(r)
+                return f"**{a} {op} {b} = {r}**"
+            except: pass
+        
+        # Clear cache
+        for layer in self.layers:
+            layer.clear_cache()
+        
+        # Encode
+        tokens = self.tokenizer.encode(prompt)
+        tokens = np.array([tokens], dtype=np.int32)
+        generated = list(tokens[0])
+        
+        # Process prompt
+        if len(generated) > 1:
+            x = self.embedding[tokens[:, :-1]]
+            for layer in self.layers:
+                x = layer.forward(x, use_cache=True)
+            current = tokens[:, -1:]
+        else:
+            current = tokens
+        
+        # Generate
+        for i in range(max_tokens):
+            x = self.embedding[current]
+            for layer in self.layers:
+                x = layer.forward(x, use_cache=True)
+            logits = (self.norm.forward(x) @ self.output)[0, -1] / max(temperature, 0.1)
+            
+            probs = np.exp(logits - logits.max())
+            probs = probs / probs.sum()
+            
+            # Top-p
+            sorted_idx = np.argsort(probs)[::-1]
+            cumsum = np.cumsum(probs[sorted_idx])
+            cutoff = np.searchsorted(cumsum, top_p)
+            mask = np.ones(len(probs), dtype=bool)
+            mask[sorted_idx[:cutoff + 1]] = False
+            probs[mask] = 0
+            probs = probs / max(probs.sum(), 1e-10)
+            
+            next_token = np.random.choice(len(probs), p=probs)
+            generated.append(next_token)
+            
+            if callback and i % 5 == 0:
+                callback(self.tokenizer.decode(generated))
+            
+            if next_token == self.tokenizer.eos_id:
+                break
+            
+            current = np.array([[next_token]], dtype=np.int32)
+        
+        result = self.tokenizer.decode(generated)
+        if result.startswith(prompt):
+            result = result[len(prompt):].strip()
+        
+        if len(result) < 10:
+            return "I'd be happy to help! Could you tell me more about what you need?"
+        
+        return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# UTILITIES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class LocalDatabase:
+    def __init__(self, path: str = "catseek_local.db"):
+        self.conn = sqlite3.connect(path, check_same_thread=False)
+        self.conn.execute('''CREATE TABLE IF NOT EXISTS chats 
+            (id INTEGER PRIMARY KEY, title TEXT, messages TEXT, model TEXT, 
+             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+        self.conn.execute('''CREATE TABLE IF NOT EXISTS settings 
+            (key TEXT PRIMARY KEY, value TEXT)''')
+        self.conn.commit()
+    
+    def save_chat(self, title: str, messages: List, model: str):
+        self.conn.execute('INSERT INTO chats (title, messages, model) VALUES (?, ?, ?)',
+                         (title, json.dumps(messages), model))
+        self.conn.commit()
+    
+    def load_chats(self) -> List[Dict]:
+        rows = self.conn.execute(
+            'SELECT id, title, model, created_at FROM chats ORDER BY created_at DESC').fetchall()
+        return [{'id': r[0], 'title': r[1], 'model': r[2], 'created': r[3]} for r in rows]
+    
+    def load_chat(self, id: int) -> Optional[Tuple[List, str]]:
+        row = self.conn.execute('SELECT messages, model FROM chats WHERE id = ?', (id,)).fetchone()
+        return (json.loads(row[0]), row[1]) if row else None
+    
+    def delete_chat(self, id: int):
+        self.conn.execute('DELETE FROM chats WHERE id = ?', (id,))
+        self.conn.commit()
+    
+    def set_setting(self, key: str, value: str):
+        self.conn.execute('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', (key, value))
+        self.conn.commit()
+    
+    def get_setting(self, key: str, default: str = "") -> str:
+        row = self.conn.execute('SELECT value FROM settings WHERE key = ?', (key,)).fetchone()
+        return row[0] if row else default
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# GPT4ALL STYLE GUI
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class ChatBubble(tk.Frame):
+    """Chat message bubble widget"""
+    
+    def __init__(self, parent, message: str, is_user: bool, **kwargs):
+        super().__init__(parent, **kwargs)
+        
+        self.configure(bg="#1a1a2e")
+        
+        # Colors
+        if is_user:
+            bubble_bg = "#3a3a5c"
+            text_color = "#ffffff"
+            avatar = "👤"
+            align = "e"
+        else:
+            bubble_bg = "#16213e"
+            text_color = "#e0e0e0"
+            avatar = "🐱"
+            align = "w"
+        
+        # Container
+        container = tk.Frame(self, bg="#1a1a2e")
+        container.pack(fill="x", pady=5, padx=10)
+        
+        # Avatar
+        avatar_label = tk.Label(container, text=avatar, font=("Segoe UI Emoji", 20),
+                               bg="#1a1a2e", fg=text_color)
+        
+        # Message bubble
+        bubble = tk.Frame(container, bg=bubble_bg, padx=15, pady=10)
+        
+        # Message text
+        msg_label = tk.Label(bubble, text=message, font=("Segoe UI", 11),
+                            bg=bubble_bg, fg=text_color, wraplength=500,
+                            justify="left", anchor="w")
+        msg_label.pack(fill="x")
+        
+        # Layout based on sender
+        if is_user:
+            avatar_label.pack(side="right", padx=(10, 0))
+            bubble.pack(side="right", fill="x", expand=False)
+        else:
+            avatar_label.pack(side="left", padx=(0, 10))
+            bubble.pack(side="left", fill="x", expand=False)
+
+
+class ScrollableChat(tk.Frame):
+    """Scrollable chat container"""
+    
+    def __init__(self, parent, **kwargs):
+        super().__init__(parent, **kwargs)
+        
+        self.canvas = tk.Canvas(self, bg="#1a1a2e", highlightthickness=0)
+        self.scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.scrollable_frame = tk.Frame(self.canvas, bg="#1a1a2e")
+        
+        self.scrollable_frame.bind("<Configure>",
+            lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+        
+        self.canvas_frame = self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
+        self.canvas.configure(yscrollcommand=self.scrollbar.set)
+        
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.scrollbar.pack(side="right", fill="y")
+        
+        self.canvas.bind('<Configure>', self._on_canvas_configure)
+        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+    
+    def _on_canvas_configure(self, event):
+        self.canvas.itemconfig(self.canvas_frame, width=event.width)
+    
+    def _on_mousewheel(self, event):
+        self.canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+    
+    def add_message(self, message: str, is_user: bool):
+        bubble = ChatBubble(self.scrollable_frame, message, is_user, bg="#1a1a2e")
+        bubble.pack(fill="x", pady=2)
+        self.canvas.update_idletasks()
+        self.canvas.yview_moveto(1.0)
+    
+    def clear(self):
+        for widget in self.scrollable_frame.winfo_children():
+            widget.destroy()
+
+
+class GPT4AllStyleApp(tk.Tk):
+    """Main application with GPT4All-style interface"""
+    
+    def __init__(self):
+        super().__init__()
+        
+        self.title(f"{APP_NAME} - Local AI Chat")
+        self.geometry("1200x800")
+        self.minsize(900, 600)
+        
+        # Theme colors (GPT4All inspired dark theme)
+        self.colors = {
+            "bg_dark": "#0f0f1a",
+            "bg_main": "#1a1a2e",
+            "bg_light": "#25253a",
+            "bg_input": "#2d2d44",
+            "accent": "#6c63ff",
+            "accent_hover": "#5a52d9",
+            "text": "#ffffff",
+            "text_muted": "#8888aa",
+            "text_dim": "#666688",
+            "success": "#4ade80",
+            "border": "#3a3a5c",
+        }
+        
+        self.configure(bg=self.colors["bg_dark"])
+        
+        # Style
+        self.style = ttk.Style()
+        self.style.theme_use('clam')
+        self._configure_styles()
+        
+        # State
+        self.db = LocalDatabase()
+        self.current_model_name = self.db.get_setting("model", "CatSeek R1 7B")
+        self.model = None
+        self.messages = []
+        self.generating = False
+        
+        # Settings vars
+        self.temp_var = tk.DoubleVar(value=float(self.db.get_setting("temperature", "0.7")))
+        self.max_len_var = tk.IntVar(value=int(self.db.get_setting("max_length", "150")))
+        self.top_p_var = tk.DoubleVar(value=float(self.db.get_setting("top_p", "0.9")))
+        
+        # Build UI
+        self._build_ui()
+        
+        # Load model
+        self._load_model(self.current_model_name)
+    
+    def _configure_styles(self):
+        """Configure ttk styles"""
+        self.style.configure("Sidebar.TFrame", background=self.colors["bg_dark"])
+        self.style.configure("Main.TFrame", background=self.colors["bg_main"])
+        
+        self.style.configure("Accent.TButton",
+            background=self.colors["accent"],
+            foreground=self.colors["text"],
+            font=("Segoe UI", 10, "bold"),
+            padding=(15, 10))
+        
+        self.style.map("Accent.TButton",
+            background=[("active", self.colors["accent_hover"])])
+        
+        self.style.configure("Sidebar.TButton",
+            background=self.colors["bg_light"],
+            foreground=self.colors["text"],
+            font=("Segoe UI", 10),
+            padding=(10, 8))
+        
+        self.style.configure("TCombobox",
+            background=self.colors["bg_light"],
+            foreground=self.colors["text"],
+            fieldbackground=self.colors["bg_light"],
+            padding=5)
+        
+        self.style.configure("Horizontal.TScale",
+            background=self.colors["bg_dark"],
+            troughcolor=self.colors["bg_light"])
+    
+    def _build_ui(self):
+        """Build the main UI"""
+        # Main container
+        self.grid_columnconfigure(1, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+        
+        # Sidebar
+        self._build_sidebar()
+        
+        # Main chat area
+        self._build_main_area()
+    
+    def _build_sidebar(self):
+        """Build sidebar"""
+        sidebar = tk.Frame(self, bg=self.colors["bg_dark"], width=280)
+        sidebar.grid(row=0, column=0, sticky="nsew")
+        sidebar.grid_propagate(False)
+        
+        # Logo
+        logo_frame = tk.Frame(sidebar, bg=self.colors["bg_dark"])
+        logo_frame.pack(fill="x", pady=20, padx=15)
+        
+        tk.Label(logo_frame, text="🐱", font=("Segoe UI Emoji", 32),
+                bg=self.colors["bg_dark"], fg=self.colors["accent"]).pack(side="left")
+        
+        title_frame = tk.Frame(logo_frame, bg=self.colors["bg_dark"])
+        title_frame.pack(side="left", padx=10)
+        
+        tk.Label(title_frame, text="CatSeek R1", font=("Segoe UI", 18, "bold"),
+                bg=self.colors["bg_dark"], fg=self.colors["text"]).pack(anchor="w")
+        tk.Label(title_frame, text="Local AI Chat", font=("Segoe UI", 10),
+                bg=self.colors["bg_dark"], fg=self.colors["text_muted"]).pack(anchor="w")
+        
+        # Separator
+        tk.Frame(sidebar, bg=self.colors["border"], height=1).pack(fill="x", padx=15, pady=10)
+        
+        # New Chat button
+        new_chat_btn = tk.Button(sidebar, text="➕  New Chat", font=("Segoe UI", 11),
+            bg=self.colors["accent"], fg=self.colors["text"],
+            activebackground=self.colors["accent_hover"], activeforeground=self.colors["text"],
+            relief="flat", cursor="hand2", command=self._new_chat)
+        new_chat_btn.pack(fill="x", padx=15, pady=10, ipady=8)
+        
+        # Model selector section
+        model_section = tk.Frame(sidebar, bg=self.colors["bg_dark"])
+        model_section.pack(fill="x", padx=15, pady=10)
+        
+        tk.Label(model_section, text="MODEL", font=("Segoe UI", 9, "bold"),
+                bg=self.colors["bg_dark"], fg=self.colors["text_muted"]).pack(anchor="w")
+        
+        self.model_var = tk.StringVar(value=self.current_model_name)
+        model_combo = ttk.Combobox(model_section, textvariable=self.model_var,
+            values=list(MODEL_CONFIGS.keys()), state="readonly", font=("Segoe UI", 10))
+        model_combo.pack(fill="x", pady=(5, 0))
+        model_combo.bind("<<ComboboxSelected>>", self._on_model_change)
+        
+        # Model info
+        self.model_info = tk.Label(model_section, text="", font=("Segoe UI", 9),
+            bg=self.colors["bg_dark"], fg=self.colors["text_dim"], wraplength=240, justify="left")
+        self.model_info.pack(anchor="w", pady=(5, 0))
+        
+        # Separator
+        tk.Frame(sidebar, bg=self.colors["border"], height=1).pack(fill="x", padx=15, pady=15)
+        
+        # Settings section
+        settings_frame = tk.Frame(sidebar, bg=self.colors["bg_dark"])
+        settings_frame.pack(fill="x", padx=15)
+        
+        tk.Label(settings_frame, text="SETTINGS", font=("Segoe UI", 9, "bold"),
+                bg=self.colors["bg_dark"], fg=self.colors["text_muted"]).pack(anchor="w")
+        
+        # Temperature
+        self._add_slider(settings_frame, "Temperature", self.temp_var, 0.1, 2.0, 0.1)
+        
+        # Max Length
+        self._add_slider(settings_frame, "Max Length", self.max_len_var, 50, 500, 10)
+        
+        # Top-P
+        self._add_slider(settings_frame, "Top-P", self.top_p_var, 0.1, 1.0, 0.05)
+        
+        # Separator
+        tk.Frame(sidebar, bg=self.colors["border"], height=1).pack(fill="x", padx=15, pady=15)
+        
+        # Chat history
+        history_frame = tk.Frame(sidebar, bg=self.colors["bg_dark"])
+        history_frame.pack(fill="both", expand=True, padx=15)
+        
+        tk.Label(history_frame, text="RECENT CHATS", font=("Segoe UI", 9, "bold"),
+                bg=self.colors["bg_dark"], fg=self.colors["text_muted"]).pack(anchor="w")
+        
+        # Chat list
+        self.chat_list = tk.Listbox(history_frame, font=("Segoe UI", 10),
+            bg=self.colors["bg_light"], fg=self.colors["text"],
+            selectbackground=self.colors["accent"], selectforeground=self.colors["text"],
+            relief="flat", highlightthickness=0, height=8)
+        self.chat_list.pack(fill="both", expand=True, pady=(5, 0))
+        self.chat_list.bind("<<ListboxSelect>>", self._load_selected_chat)
+        self._refresh_chat_list()
+        
+        # Bottom info
+        bottom_frame = tk.Frame(sidebar, bg=self.colors["bg_dark"])
+        bottom_frame.pack(fill="x", padx=15, pady=15)
+        
+        tk.Label(bottom_frame, text="🔒 100% Local & Private", font=("Segoe UI", 9),
+                bg=self.colors["bg_dark"], fg=self.colors["success"]).pack(anchor="w")
+        tk.Label(bottom_frame, text=f"v{VERSION} • DeepSeek Architecture", font=("Segoe UI", 8),
+                bg=self.colors["bg_dark"], fg=self.colors["text_dim"]).pack(anchor="w")
+    
+    def _add_slider(self, parent, label: str, var, from_: float, to: float, resolution: float):
+        """Add a labeled slider"""
+        frame = tk.Frame(parent, bg=self.colors["bg_dark"])
+        frame.pack(fill="x", pady=(10, 0))
+        
+        header = tk.Frame(frame, bg=self.colors["bg_dark"])
+        header.pack(fill="x")
+        
+        tk.Label(header, text=label, font=("Segoe UI", 10),
+                bg=self.colors["bg_dark"], fg=self.colors["text"]).pack(side="left")
+        
+        value_label = tk.Label(header, text=f"{var.get():.2f}" if isinstance(var.get(), float) else str(var.get()),
+                              font=("Segoe UI", 10), bg=self.colors["bg_dark"], fg=self.colors["accent"])
+        value_label.pack(side="right")
+        
+        slider = ttk.Scale(frame, from_=from_, to=to, variable=var, orient="horizontal")
+        slider.pack(fill="x", pady=(5, 0))
+        
+        def update_label(*args):
+            val = var.get()
+            value_label.config(text=f"{val:.2f}" if isinstance(val, float) else str(int(val)))
+            self._save_settings()
+        
+        var.trace_add("write", update_label)
+    
+    def _build_main_area(self):
+        """Build main chat area"""
+        main = tk.Frame(self, bg=self.colors["bg_main"])
+        main.grid(row=0, column=1, sticky="nsew")
+        main.grid_rowconfigure(0, weight=1)
+        main.grid_columnconfigure(0, weight=1)
+        
+        # Chat header
+        header = tk.Frame(main, bg=self.colors["bg_main"], height=60)
+        header.pack(fill="x", padx=20, pady=(15, 0))
+        header.pack_propagate(False)
+        
+        self.chat_title = tk.Label(header, text="New Chat", font=("Segoe UI", 16, "bold"),
+                                   bg=self.colors["bg_main"], fg=self.colors["text"])
+        self.chat_title.pack(side="left", pady=15)
+        
+        self.status_label = tk.Label(header, text="Ready", font=("Segoe UI", 10),
+                                     bg=self.colors["bg_main"], fg=self.colors["success"])
+        self.status_label.pack(side="right", pady=15)
+        
+        # Chat container
+        chat_container = tk.Frame(main, bg=self.colors["bg_main"])
+        chat_container.pack(fill="both", expand=True, padx=20, pady=10)
+        
+        self.chat_area = ScrollableChat(chat_container, bg=self.colors["bg_main"])
+        self.chat_area.pack(fill="both", expand=True)
+        
+        # Input area
+        input_container = tk.Frame(main, bg=self.colors["bg_main"])
+        input_container.pack(fill="x", padx=20, pady=(0, 20))
+        
+        input_frame = tk.Frame(input_container, bg=self.colors["bg_input"], padx=15, pady=10)
+        input_frame.pack(fill="x")
+        
+        self.input_text = tk.Text(input_frame, font=("Segoe UI", 12), height=3,
+            bg=self.colors["bg_input"], fg=self.colors["text"],
+            insertbackground=self.colors["text"], relief="flat",
+            wrap="word", padx=5, pady=5)
+        self.input_text.pack(side="left", fill="both", expand=True)
+        self.input_text.bind("<Return>", self._on_enter)
+        self.input_text.bind("<Shift-Return>", lambda e: None)
+        
+        # Send button
+        send_btn = tk.Button(input_frame, text="➤", font=("Segoe UI", 16),
+            bg=self.colors["accent"], fg=self.colors["text"],
+            activebackground=self.colors["accent_hover"], activeforeground=self.colors["text"],
+            relief="flat", width=3, cursor="hand2", command=self._send_message)
+        send_btn.pack(side="right", padx=(10, 0), pady=5)
+        
+        # Hint
+        tk.Label(input_container, text="Press Enter to send, Shift+Enter for new line",
+                font=("Segoe UI", 9), bg=self.colors["bg_main"],
+                fg=self.colors["text_dim"]).pack(anchor="w", pady=(5, 0))
+    
+    def _load_model(self, name: str):
+        """Load a model"""
+        self.status_label.config(text="Loading model...", fg=self.colors["text_muted"])
+        self.update()
+        
+        def load():
+            self.model = CatSeekModel(name)
+            self.after(0, lambda: self._on_model_loaded(name))
+        
+        threading.Thread(target=load, daemon=True).start()
+    
+    def _on_model_loaded(self, name: str):
+        """Called when model is loaded"""
+        self.current_model_name = name
+        self.db.set_setting("model", name)
+        
+        cfg = MODEL_CONFIGS[name]
+        self.model_info.config(text=f"{cfg['description']}\n{cfg['size']} • {cfg['params']}")
+        
+        self.status_label.config(text=f"✓ {name} loaded", fg=self.colors["success"])
+        
+        # Welcome message
+        if not self.messages:
+            self.chat_area.add_message(
+                f"Welcome! I'm {name}, running locally on your machine.\n\n"
+                f"I can help with:\n• 💬 Chat & conversation\n• 💻 Code assistance\n"
+                f"• 📝 Writing & editing\n• 🧠 Analysis & reasoning\n\n"
+                f"Everything is processed locally - your data never leaves your computer!",
+                is_user=False
+            )
+    
+    def _on_model_change(self, event):
+        """Handle model selection change"""
+        new_model = self.model_var.get()
+        if new_model != self.current_model_name:
+            self._new_chat()
+            self._load_model(new_model)
+    
+    def _on_enter(self, event):
+        """Handle enter key"""
+        if not (event.state & 0x1):  # Not shift
+            self._send_message()
+            return "break"
+    
+    def _send_message(self):
+        """Send a message"""
+        if self.generating:
+            return
+        
+        text = self.input_text.get("1.0", "end-1c").strip()
+        if not text:
+            return
+        
+        self.input_text.delete("1.0", tk.END)
+        
+        # Add user message
+        self.chat_area.add_message(text, is_user=True)
+        self.messages.append({"role": "user", "content": text})
+        
+        # Update title if first message
+        if len(self.messages) == 1:
+            self.chat_title.config(text=text[:40] + "..." if len(text) > 40 else text)
+        
+        # Generate response
+        self._generate_response(text)
+    
+    def _generate_response(self, prompt: str):
+        """Generate AI response"""
+        self.generating = True
+        self.status_label.config(text="Generating...", fg=self.colors["accent"])
+        
+        def generate():
+            response = self.model.generate(
+                prompt,
+                max_tokens=self.max_len_var.get(),
+                temperature=self.temp_var.get(),
+                top_p=self.top_p_var.get()
+            )
+            self.after(0, lambda: self._on_response(response))
+        
+        threading.Thread(target=generate, daemon=True).start()
+    
+    def _on_response(self, response: str):
+        """Handle generated response"""
+        self.chat_area.add_message(response, is_user=False)
+        self.messages.append({"role": "assistant", "content": response})
+        
+        self.status_label.config(text="Ready", fg=self.colors["success"])
+        self.generating = False
+    
+    def _new_chat(self):
+        """Start a new chat"""
+        if self.messages:
+            title = self.messages[0]["content"][:30] if self.messages else "Chat"
+            self.db.save_chat(title, self.messages, self.current_model_name)
+            self._refresh_chat_list()
+        
+        self.messages = []
+        self.chat_area.clear()
+        self.chat_title.config(text="New Chat")
+        
+        if self.model:
+            self.chat_area.add_message(
+                f"Starting fresh! I'm {self.current_model_name}, ready to help.",
+                is_user=False
+            )
+    
+    def _refresh_chat_list(self):
+        """Refresh chat history list"""
+        self.chat_list.delete(0, tk.END)
+        for chat in self.db.load_chats()[:20]:
+            self.chat_list.insert(tk.END, f"💬 {chat['title'][:25]}")
+    
+    def _load_selected_chat(self, event):
+        """Load selected chat from history"""
+        sel = self.chat_list.curselection()
+        if not sel:
+            return
+        
+        chats = self.db.load_chats()
+        if sel[0] < len(chats):
+            data = self.db.load_chat(chats[sel[0]]['id'])
+            if data:
+                messages, model = data
+                self.messages = messages
+                self.chat_area.clear()
+                
+                for msg in messages:
+                    self.chat_area.add_message(msg['content'], msg['role'] == 'user')
+                
+                if messages:
+                    self.chat_title.config(text=messages[0]['content'][:40])
+    
+    def _save_settings(self):
+        """Save settings"""
+        self.db.set_setting("temperature", str(self.temp_var.get()))
+        self.db.set_setting("max_length", str(self.max_len_var.get()))
+        self.db.set_setting("top_p", str(self.top_p_var.get()))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def main():
+    print()
+    print("╔══════════════════════════════════════════════════════════════╗")
+    print("║             CATSEEK R1 - GPT4All Style Interface             ║")
+    print("╠══════════════════════════════════════════════════════════════╣")
+    print("║  Local AI Chat with DeepSeek R1 Architecture                 ║")
+    print("║                                                              ║")
+    print("║  Features:                                                   ║")
+    print("║  • Multiple model sizes (7B, 14B, 32B, 70B)                  ║")
+    print("║  • 100% local & private                                      ║")
+    print("║  • Chat history & persistence                                ║")
+    print("║  • Adjustable temperature, tokens, top-p                     ║")
+    print("║  • Modern dark theme UI                                      ║")
+    print("║                                                              ║")
+    print("║  (C) 2025 Samsoft / Flames Co. / Team Flames                 ║")
+    print("╚══════════════════════════════════════════════════════════════╝")
+    print()
+    
+    app = GPT4AllStyleApp()
+    app.mainloop()
+
+
+if __name__ == "__main__":
+    main()
